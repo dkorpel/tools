@@ -146,60 +146,6 @@ string escapeParens(string input)
     return input.translate(parenToMacro);
 }
 
-/**
-Get the date of the previous release, which is the start of the revision range
-
-This is more reliable than the date of the oldest commit in the range, because
-merging in an unrelated history (like the spec sources) drags in commits that
-are years older than the previous release.
-*/
-Nullable!DateTime getPreviousReleaseDateTime(string revRange)
-{
-    auto parts = revRange.split("..");
-    if (parts.length < 2 || parts[0].empty)
-        return Nullable!(DateTime).init;
-
-    foreach (repo; ["dmd", "phobos", "dlang.org", "tools", "installer"]
-             .map!(r => buildPath("..", r)))
-    {
-        auto cmd = ["git", "-C", repo, "log", "-1", "--no-patch", "--no-notes"
-            , "--date=format-local:%Y-%m-%dT%H:%M:%S", "--pretty=%cd"
-            , parts[0]];
-        auto p = pipeProcess(cmd, Redirect.stdout);
-        auto lines = p.stdout.byLineCopy.map!strip.filter!(l => !l.empty).array;
-        if (wait(p.pid) != 0 || lines.empty)
-            continue;
-        return DateTime.fromISOExtString(lines.front).nullable;
-    }
-    return Nullable!(DateTime).init;
-}
-
-Nullable!DateTime getFirstDateTime(string revRange)
-{
-    DateTime[] all;
-
-    foreach (repo; ["dmd", "phobos", "dlang.org", "tools", "installer"]
-             .map!(r => buildPath("..", r)))
-    {
-        auto cmd = ["git", "-C", repo, "log", "--no-patch", "--no-notes"
-            , "--date=format-local:%Y-%m-%dT%H:%M:%S", "--pretty=%cd"
-            , revRange];
-        auto p = pipeProcess(cmd, Redirect.stdout);
-        all ~= p.stdout.byLine()
-            .map!((char[] l) {
-                auto r = DateTime.fromISOExtString(l);
-                return r;
-            })
-            .array;
-    }
-
-    all.sort();
-
-    return all.empty
-        ? Nullable!(DateTime).init
-        : all.front.nullable;
-}
-
 struct GitIssues
 {
     int[] bugzillaIssueIds;
@@ -219,7 +165,9 @@ GitIssues getIssues(string revRange)
     // Note: "Bugzilla" is required since https://github.com/dlang/dlang-bot/pull/302;
     // temporarily both are accepted during a transition period.
     enum closedREBZ = ctRegex!(`(?:^fix(?:es)?(?:\s+bugzilla)?(?:\s+(?:issues?|bugs?))?\s+(#?\d+(?:[\s,\+&and]+#?\d+)*))`, "i");
-    enum closedREGH = ctRegex!(`(?:^fix(?:es)?(?:\s+github)?(?:\s+(?:issues?|bugs?))?\s+(#?\d+(?:[\s,\+&and]+#?\d+)*))`, "i");
+    // A GitHub issue reference must use `#`, so that Bugzilla-era references
+    // like `Fix Issue 17581` aren't read as GitHub issue numbers.
+    enum closedREGH = ctRegex!(`(?:^fix(?:es)?(?:\s+github)?(?:\s+(?:issues?|bugs?))?\s*:?\s*(#\d+(?:[\s,\+&and]+#\d+)*))`, "i");
 
     auto issuesBZ = appender!(int[]);
     int[][string] issuesGH;
@@ -335,7 +283,7 @@ Nullable!int getBugzillaId(string body_)
 }
 
 GithubIssue[][string /*type*/ ][string /*comp*/] getGithubIssuesRest(string revRange,
-        const DateTime startDate, const DateTime endDate, const string bearer)
+        const DateTime endDate, const string bearer)
 {
     GithubIssue[][string][string] ret;
     // Keep this list of comps in sync with the switch statement in writeBugzillaChanges
@@ -359,7 +307,7 @@ GithubIssue[][string /*type*/ ][string /*comp*/] getGithubIssuesRest(string revR
 
         GithubIssue[][string /* type */] tmp;
         GithubIssue[] ghi = getGithubIssuesRest("dlang", project,
-                issues.githubIssueIds[project], startDate, endDate, bearer);
+                issues.githubIssueIds[project], endDate, bearer);
         foreach (jt; ghi)
         {
             GithubIssue[]* p = jt.type in tmp;
@@ -380,20 +328,19 @@ GithubIssue[][string /*type*/ ][string /*comp*/] getGithubIssuesRest(string revR
 /**
 Get the closed issues of a github project that are referenced in the git log
 
-Only issues closed in the `[startDate, endDate]` window are returned, so that
-stale references to unrelated issues with the same number don't end up in the
-changelog.
+Issues closed after `endDate` are not returned. There is no lower bound: a fix
+can reach a release branch long after the issue was closed on master, so the
+git log is the authority on what is part of this release.
 
 Params:
     project = almost always the dlang github project
     repo = the name of the repo to get the closed issues for
     numbers = the issue numbers referenced by the commits of the release
-    startDate = issues closed before this date are not part of this release
     endDate = the cutoff date for closed issues
     bearer = the classic github bearer token
 */
 GithubIssue[] getGithubIssuesRest(const string project, const string repo
-        , const int[] numbers, const DateTime startDate, const DateTime endDate
+        , const int[] numbers, const DateTime endDate
         , const string bearer)
 {
     GithubIssue[] ret;
@@ -478,7 +425,7 @@ GithubIssue[] getGithubIssuesRest(const string project, const string repo
                     ? d[0 .. $ - 1]
                     : d;
                 tmp.closedAt = DateTime.fromISOExtString(d);
-                if (tmp.closedAt < startDate || tmp.closedAt > endDate)
+                if (tmp.closedAt > endDate)
                     continue;
             }
             {
@@ -818,11 +765,7 @@ Please supply a bugzilla version
                 , githubClassicTokenFileName));
         const string githubToken = readText(githubClassicTokenFileName).strip();
 
-        Nullable!(DateTime) firstDate = getPreviousReleaseDateTime(revRange);
-        if (firstDate.isNull())
-            firstDate = getFirstDateTime(revRange);
-        enforce(!firstDate.isNull(), "Couldn't find a date from the revRange");
-        githubChanges = getGithubIssuesRest(revRange, firstDate.get(), cast(DateTime)currDate
+        githubChanges = getGithubIssuesRest(revRange, cast(DateTime)currDate
                 , githubToken);
     }
 
