@@ -152,6 +152,145 @@ struct GitIssues
     int[][string] githubIssueIds;
 }
 
+/**
+The GitHub issues that a pull request closes, as GitHub itself resolved them
+from the closing keywords in the pull request body and its commits.
+
+This is the primary source of the issue list: it needs no parsing of commit
+messages, and it cannot confuse a Bugzilla number with a GitHub issue number.
+
+Params:
+    repo = the name of the repo the pull requests were merged in
+    prs = pull request numbers, as found in the git log
+    bearer = the classic github bearer token
+
+Returns: issue numbers, keyed by the repo the issue lives in
+*/
+int[][string] getClosingIssueRefs(const string repo, const int[] prs, const string bearer)
+{
+    int[][string] ret;
+    // one request per batch of pull requests, as aliased sub queries
+    enum batchSize = 50;
+    for (size_t i = 0; i < prs.length; i += batchSize)
+    {
+        const batch = prs[i .. min(i + batchSize, $)];
+        auto query = appender!string;
+        query.put(`{"query":"query{repository(owner:\"dlang\",name:\"` ~ repo ~ `\"){`);
+        foreach (nr; batch)
+            query.formattedWrite(`p%d:pullRequest(number:%d){closingIssuesReferences(first:20)`
+                ~ `{nodes{number repository{name}}}} `, nr, nr);
+        query.put(`}}"}`);
+
+        HTTP http = HTTP("https://api.github.com/graphql");
+        http.method = HTTP.Method.post;
+        http.addRequestHeader("Authorization", bearer.startsWith("Bearer ") ? bearer : "Bearer " ~ bearer);
+        http.addRequestHeader("Content-Type", "application/json");
+        http.setPostData(query.data, "application/json");
+
+        char[] response;
+        int statusCode;
+        http.onReceive = (ubyte[] d) { response ~= cast(char[])d; return d.length; };
+        http.onReceiveStatusLine = (HTTP.StatusLine line) { statusCode = line.code; };
+        http.perform();
+        enforce(statusCode == 200, "GraphQL returned status %d:\n%s"
+                .format(statusCode, cast(string)response));
+
+        JSONValue json = parseJSON(cast(string)response);
+        const(JSONValue)* data = "data" in json;
+        if (data is null || (*data).type != JSONType.object)
+            continue;
+        const(JSONValue)* repository = "repository" in *data;
+        if (repository is null || (*repository).type != JSONType.object)
+            continue;
+        foreach (_, pr; (*repository).object)
+        {
+            // a number in the log that is not a pull request comes back as null
+            if (pr.type != JSONType.object)
+                continue;
+            foreach (node; pr["closingIssuesReferences"]["nodes"].arrayNoRef())
+                ret[node["repository"]["name"].get!string] ~= node["number"].get!int();
+        }
+    }
+    foreach (name; ret.keys)
+        ret[name] = ret[name].sort().release.uniq.array;
+    return ret;
+}
+
+/** Get the pull requests merged in revRange, from the merge and squash commit subjects */
+int[] getMergedPullRequests(const string repo, string revRange)
+{
+    import std.regex : ctRegex, matchFirst;
+
+    enum squashRE = ctRegex!(`\(#(\d+)\)$`);
+    enum mergeRE = ctRegex!(`^Merge pull request #(\d+)`);
+
+    auto cmd = ["git", "-C", buildPath("..", repo), "log", "--pretty=%s", revRange];
+    auto p = pipeProcess(cmd, Redirect.stdout);
+    scope(exit) enforce(wait(p.pid) == 0, "Failed to execute '%(%s %)'.".format(cmd));
+
+    auto ret = appender!(int[]);
+    foreach (line; p.stdout.byLine())
+    {
+        if (auto m = matchFirst(line, squashRE))
+            ret ~= m[1].to!int;
+        else if (auto m = matchFirst(line, mergeRE))
+            ret ~= m[1].to!int;
+    }
+    return ret.data.sort().release.uniq.array;
+}
+
+/**
+Manual corrections to the issue list, read from `dlang.org/changelog/<version>.issues`.
+
+A pull request that closes an issue without saying so anywhere leaves no trace
+for either source to pick up, so the list has to be correctable by hand:
+
+---
+# dmd#22784 fixed this without linking the issue
++dmd#22769
+# fixed in 3aaa3990b9, reverted again in fccef86756
+-dmd#19499
+---
+
+Lines starting with `#` and blank lines are ignored.
+
+Params:
+    version_ = the release the changelog is generated for, e.g. `2.113.0`
+
+Returns: issue numbers to add and to remove, keyed by the repo they live in
+*/
+auto getIssueOverrides(string version_)
+{
+    static struct Overrides
+    {
+        int[][string] add;
+        bool[int][string] remove;
+    }
+    Overrides ret;
+    const path = buildPath(__FILE_FULL_PATH__.dirName, "..", "dlang.org", "changelog",
+            version_ ~ ".issues");
+    if (!path.exists)
+        return ret;
+
+    foreach (line; File(path).byLineCopy.map!strip)
+    {
+        if (line.empty || line.startsWith("#"))
+            continue;
+        const add = line.startsWith("+");
+        enforce(add || line.startsWith("-"), format(
+                "%s: line must start with '+' or '-': %s", path, line));
+        auto parts = line[1 .. $].strip.findSplit("#");
+        enforce(!parts[1].empty, format("%s: expected <repo>#<number>: %s", path, line));
+        const repo = parts[0].strip;
+        const number = parts[2].strip.to!int;
+        if (add)
+            ret.add[repo] ~= number;
+        else
+            ret.remove[repo][number] = true;
+    }
+    return ret;
+}
+
 /** Get a list of all bugzilla issues mentioned in revRange */
 GitIssues getIssues(string revRange)
 {
@@ -283,7 +422,7 @@ Nullable!int getBugzillaId(string body_)
 }
 
 GithubIssue[][string /*type*/ ][string /*comp*/] getGithubIssuesRest(string revRange,
-        const DateTime endDate, const string bearer)
+        string version_, const DateTime endDate, const string bearer)
 {
     GithubIssue[][string][string] ret;
     // Keep this list of comps in sync with the switch statement in writeBugzillaChanges
@@ -297,17 +436,39 @@ GithubIssue[][string /*type*/ ][string /*comp*/] getGithubIssuesRest(string revR
       //, [ "visuald", "VisualD"]   // ???:
         , [ "installer", "Installer"]
         ];
-    GitIssues issues = getIssues(revRange);
+    // GitHub knows which issues a pull request closes, so that is the primary
+    // source; the commit messages catch what is pushed outside a pull request
+    int[][string] numbers = getIssues(revRange).githubIssueIds;
+    foreach (it; comps)
+        foreach (repo, refs; getClosingIssueRefs(it[0], getMergedPullRequests(it[0], revRange), bearer))
+            numbers[repo] ~= refs;
+
+    // and neither source sees a pull request that closes an issue silently
+    auto overrides = getIssueOverrides(version_);
+    bool[int][string] forced;
+    foreach (repo, add; overrides.add)
+        foreach (number; add)
+        {
+            numbers[repo] ~= number;
+            forced[repo][number] = true;
+        }
+    foreach (repo, ref refs; numbers)
+    {
+        if (auto remove = repo in overrides.remove)
+            refs = refs.filter!(n => n !in *remove).array;
+        refs = refs.sort().release.uniq.array;
+    }
+
     foreach (it; comps)
     {
         // abort prematurely if no issues are found in all git logs
         string project = it[0];
-        if (project !in issues.githubIssueIds || issues.githubIssueIds[project].empty)
+        if (project !in numbers || numbers[project].empty)
             continue;
 
         GithubIssue[][string /* type */] tmp;
         GithubIssue[] ghi = getGithubIssuesRest("dlang", project,
-                issues.githubIssueIds[project], endDate, bearer);
+                numbers[project], endDate, bearer, forced.get(project, null));
         foreach (jt; ghi)
         {
             GithubIssue[]* p = jt.type in tmp;
@@ -338,10 +499,11 @@ Params:
     numbers = the issue numbers referenced by the commits of the release
     endDate = the cutoff date for closed issues
     bearer = the classic github bearer token
+    forced = issues added by hand, which are listed whether closed or not
 */
 GithubIssue[] getGithubIssuesRest(const string project, const string repo
         , const int[] numbers, const DateTime endDate
-        , const string bearer)
+        , const string bearer, const bool[int] forced = null)
 {
     GithubIssue[] ret;
 
@@ -417,15 +579,21 @@ GithubIssue[] getGithubIssuesRest(const string project, const string repo
                 const(JSONValue)* mem = "closed_at" in it;
                 enforce(mem !is null, it.toPrettyString()
                         ~ "\nmust contain 'closed_at'");
-                // still open, so not part of this release
+                // still open, so not part of this release, unless listed by hand
                 if ((*mem).type != JSONType.string)
+                {
+                    if (number in forced)
+                    {
+                        ret ~= tmp;
+                    }
                     continue;
+                }
                 string d = (*mem).get!string();
                 d = d.endsWith("Z")
                     ? d[0 .. $ - 1]
                     : d;
                 tmp.closedAt = DateTime.fromISOExtString(d);
-                if (tmp.closedAt > endDate)
+                if (tmp.closedAt > endDate && number !in forced)
                     continue;
             }
             {
@@ -765,8 +933,8 @@ Please supply a bugzilla version
                 , githubClassicTokenFileName));
         const string githubToken = readText(githubClassicTokenFileName).strip();
 
-        githubChanges = getGithubIssuesRest(revRange, cast(DateTime)currDate
-                , githubToken);
+        githubChanges = getGithubIssuesRest(revRange, nextVersionString
+                , cast(DateTime)currDate, githubToken);
     }
 
     // Accumulate contributors from the git log
