@@ -147,6 +147,22 @@ string escapeParens(string input)
 }
 
 /**
+Get the commit where `from` forked off from `to`
+
+Returns: the merge base, or an empty string when `from` is an ancestor of `to`
+or when the revisions don't exist in `repo`
+*/
+string forkPoint(string repo, string from, string to)
+{
+    auto r = execute(["git", "-C", repo, "merge-base", from, to]);
+    if (r.status != 0)
+        return null;
+    const base = r.output.strip;
+    const head = execute(["git", "-C", repo, "rev-parse", from ~ "^{commit}"]);
+    return head.status == 0 && head.output.strip == base ? null : base;
+}
+
+/**
 Get the date of the previous release, which is the start of the revision range
 
 This is more reliable than the date of the oldest commit in the range, because
@@ -162,6 +178,11 @@ Nullable!DateTime getPreviousReleaseDateTime(string revRange)
     foreach (repo; ["dmd", "phobos", "dlang.org", "tools", "installer"]
              .map!(r => buildPath("..", r)))
     {
+        // the previous release was cut from another branch, so its date says
+        // nothing about which fixes are new in this one
+        if (forkPoint(repo, parts[0], parts[1]).length)
+            return Nullable!(DateTime).init;
+
         auto cmd = ["git", "-C", repo, "log", "-1", "--no-patch", "--no-notes"
             , "--date=format-local:%Y-%m-%dT%H:%M:%S", "--pretty=%cd"
             , parts[0]];
@@ -220,6 +241,7 @@ GitIssues getIssues(string revRange)
     // temporarily both are accepted during a transition period.
     enum closedREBZ = ctRegex!(`(?:^fix(?:es)?(?:\s+bugzilla)?(?:\s+(?:issues?|bugs?))?\s+(#?\d+(?:[\s,\+&and]+#?\d+)*))`, "i");
     enum closedREGH = ctRegex!(`(?:^fix(?:es)?(?:\s+github)?(?:\s+(?:issues?|bugs?))?\s+(#?\d+(?:[\s,\+&and]+#?\d+)*))`, "i");
+    enum closedREGHKeyword = ctRegex!(`(?:^(?:close[sd]?|resolve[sd]?)\s+(#\d+(?:[\s,\+&and]+#\d+)*))`, "i");
 
     auto issuesBZ = appender!(int[]);
     int[][string] issuesGH;
@@ -231,31 +253,52 @@ GitIssues getIssues(string revRange)
         auto p = pipeProcess(cmd, Redirect.stdout);
         enforce(wait(p.pid) == 0, "Failed to execute '%(%s %)'.".format(cmd));
 
-        cmd = ["git", "-C", repo, "log", revRange];
-        p = pipeProcess(cmd, Redirect.stdout);
-        scope(exit) enforce(wait(p.pid) == 0, "Failed to execute '%(%s %)'.".format(cmd));
-
-        auto matchesGH = appender!(int[]);
-        foreach (line; p.stdout.byLine())
+        int[] issuesInLog(string range)
         {
-            if (auto m = match(line.stripLeft, closedREBZ))
+            auto logCmd = ["git", "-C", repo, "log", range];
+            auto log = pipeProcess(logCmd, Redirect.stdout);
+            scope(exit) enforce(wait(log.pid) == 0, "Failed to execute '%(%s %)'.".format(logCmd));
+
+            auto matchesGH = appender!(int[]);
+            foreach (line; log.stdout.byLine())
             {
-                m.captures[1]
-                    .splitter(ctRegex!`[^\d]+`)
-                    .filter!(b => b.length)
-                    .map!(to!int)
-                    .copy(issuesBZ);
+                if (auto m = match(line.stripLeft, closedREBZ))
+                {
+                    m.captures[1]
+                        .splitter(ctRegex!`[^\d]+`)
+                        .filter!(b => b.length)
+                        .map!(to!int)
+                        .copy(issuesBZ);
+                }
+                auto m = match(line.stripLeft, closedREGH);
+                if (!m)
+                    m = match(line.stripLeft, closedREGHKeyword);
+                if (m)
+                {
+                    m.captures[1]
+                        .splitter(ctRegex!`[^\d]+`)
+                        .filter!(b => b.length)
+                        .map!(to!int)
+                        .copy(matchesGH);
+                }
             }
-            if (auto m = match(line.stripLeft, closedREGH))
+            return matchesGH.data.sort().release.uniq.array;
+        }
+
+        int[] found = issuesInLog(revRange);
+
+        // fixes that also landed on the branch of the previous release have shipped already
+        auto parts = revRange.split("..");
+        if (parts.length == 2)
+        {
+            const base = forkPoint(repo, parts[0], parts[1]);
+            if (base.length)
             {
-                m.captures[1]
-                    .splitter(ctRegex!`[^\d]+`)
-                    .filter!(b => b.length)
-                    .map!(to!int)
-                    .copy(matchesGH);
+                auto shipped = issuesInLog(base ~ ".." ~ parts[0]);
+                found = found.filter!(i => !shipped.canFind(i)).array;
             }
         }
-        issuesGH[repo[3..$]] = matchesGH.data.sort().release.uniq.array;
+        issuesGH[repo[3..$]] = found;
     }
     return GitIssues(issuesBZ.data.sort().release.uniq.array, issuesGH);
 }
